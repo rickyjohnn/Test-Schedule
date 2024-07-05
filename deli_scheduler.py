@@ -8,50 +8,254 @@ def parse_shift_time(shift_string, target_day):
         for shift in shifts:
             parts = shift.split()
             if len(parts) < 2:
-                continue  # Skip this shift if it doesn't have enough parts
-            day = parts[0]
+                continue
+            day, times = parts[0], parts[-1]
             if day[:3].lower() == target_day[:3].lower():
-                times = parts[-1]  # Assume the last part contains the times
                 start_time, end_time = times.split('-')
                 return datetime.strptime(start_time, "%H:%M").time(), datetime.strptime(end_time, "%H:%M").time()
     except Exception as e:
         print(f"Error parsing shift time for '{shift_string}': {e}")
     return None, None
 
-def generate_daily_schedule(df, target_date):
+def adjust_shift_duration(start_time, end_time, employment_status):
+    shift_duration = datetime.combine(datetime.min, end_time) - datetime.combine(datetime.min, start_time)
+    if employment_status == 'Part-Time':
+        min_duration = timedelta(hours=4)
+        max_duration = timedelta(hours=8)
+    else:  # Full-Time
+        min_duration = timedelta(hours=8)
+        max_duration = timedelta(hours=10)
+    
+    if shift_duration < min_duration:
+        end_time = (datetime.combine(datetime.min, start_time) + min_duration).time()
+    elif shift_duration > max_duration:
+        end_time = (datetime.combine(datetime.min, start_time) + max_duration).time()
+    
+    return start_time, end_time
+
+def schedule_meal_break(start_time, end_time, staff_count):
+    shift_duration = datetime.combine(datetime.min, end_time) - datetime.combine(datetime.min, start_time)
+    meal_duration = timedelta(minutes=30) if shift_duration <= timedelta(hours=6) else timedelta(hours=1)
+
+    possible_break_starts = [
+        datetime.combine(datetime.min, start_time) + timedelta(hours=2),
+        datetime.combine(datetime.min, start_time) + (shift_duration - meal_duration) / 2,
+        datetime.combine(datetime.min, end_time) - timedelta(hours=2) - meal_duration
+    ]
+
+    for break_start in possible_break_starts:
+        break_end = break_start + meal_duration
+        if is_break_time_valid(break_start.time(), break_end.time(), staff_count):
+            return break_start.time(), break_end.time()
+
+    meal_start = datetime.combine(datetime.min, start_time) + (shift_duration - meal_duration) / 2
+    meal_end = meal_start + meal_duration
+    return meal_start.time(), meal_end.time()
+
+def is_break_time_valid(break_start, break_end, staff_count):
+    morning_requirement = break_start < datetime.strptime("08:00", "%H:%M").time() and staff_count > 6
+    midday_requirement = (datetime.strptime("10:30", "%H:%M").time() <= break_start < datetime.strptime("14:00", "%H:%M").time()) and staff_count > 10
+    evening_requirement = (datetime.strptime("21:00", "%H:%M").time() <= break_start < datetime.strptime("23:00", "%H:%M").time()) and staff_count > 4
+    return not (morning_requirement or midday_requirement or evening_requirement)
+
+def format_time_range(start_time, end_time):
+    return f"{start_time.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')}"
+
+def count_employees_in_timeframe(employees, start_hour, end_hour):
+    count = 0
+    for employee in employees:
+        start_time = employee[2][0]
+        end_time = employee[2][1]
+        if (start_time.hour < end_hour and end_time.hour > start_hour) or (start_time.hour == start_hour) or (end_time.hour == end_hour):
+            count += 1
+    return count
+
+def ensure_late_night_coverage(scheduled_employees, all_employees, max_employees_per_day):
+    late_night_count = sum(1 for e in scheduled_employees if e[2][1] == datetime.strptime("23:00", "%H:%M").time())
+    if late_night_count < 4:
+        additional_needed = 4 - late_night_count
+        
+        candidates = sorted(
+            [e for e in all_employees if e not in scheduled_employees and e[2][1] >= datetime.strptime("21:00", "%H:%M").time()],
+            key=lambda x: x[2][1],
+            reverse=True
+        )
+        
+        for employee in candidates:
+            if additional_needed == 0 or len(scheduled_employees) >= max_employees_per_day:
+                break
+            
+            start_time, end_time = employee[2]
+            
+            if end_time == datetime.strptime("23:00", "%H:%M").time():
+                scheduled_employees.append(employee)
+                additional_needed -= 1
+            elif end_time >= datetime.strptime("21:00", "%H:%M").time():
+                shift_duration = datetime.combine(datetime.min, end_time) - datetime.combine(datetime.min, start_time)
+                max_duration = timedelta(hours=10 if employee[5] == 'Full-Time' else 8)
+                required_duration = datetime.combine(datetime.min, datetime.strptime("23:00", "%H:%M").time()) - datetime.combine(datetime.min, start_time)
+                
+                if required_duration <= max_duration:
+                    new_start_time = (datetime.combine(datetime.min, datetime.strptime("23:00", "%H:%M").time()) - shift_duration).time()
+                    employee = employee[:2] + ((new_start_time, datetime.strptime("23:00", "%H:%M").time()),) + employee[3:]
+                    scheduled_employees.append(employee)
+                    additional_needed -= 1
+
+    return scheduled_employees
+
+def distribute_shifts_evenly(scheduled_employees, all_employees, max_employees_per_day, hourly_staff_count):
+    remaining_employees = [e for e in all_employees if e not in scheduled_employees]
+    remaining_employees.sort(key=lambda x: x[2][0])
+
+    for employee in remaining_employees:
+        if len(scheduled_employees) >= max_employees_per_day:
+            break
+        start_time = employee[2][0]
+        end_time = employee[2][1]
+        shift_duration = (datetime.combine(datetime.min, end_time) - datetime.combine(datetime.min, start_time)).seconds // 3600
+
+        best_start_time = start_time
+        min_coverage_gap = float('inf')
+
+        for hour in range(start_time.hour, end_time.hour - shift_duration + 1):
+            coverage_gap = sum(1 for i in range(hour, hour + shift_duration) if hourly_staff_count[i] < 8)
+            if coverage_gap < min_coverage_gap:
+                min_coverage_gap = coverage_gap
+                best_start_time = (datetime.combine(datetime.min, start_time) + timedelta(hours=hour - start_time.hour)).time()
+
+        end_time = (datetime.combine(datetime.min, best_start_time) + timedelta(hours=shift_duration)).time()
+        scheduled_employees.append(employee[:2] + ((best_start_time, end_time),) + employee[3:])
+
+        for hour in range(best_start_time.hour, end_time.hour):
+            hourly_staff_count[hour] += 1
+
+    return scheduled_employees
+
+def generate_daily_schedule(df, target_date, weekly_late_night_counts):
     target_day = target_date.strftime('%a')
-    print(f"\nSchedule for {target_date.strftime('%A, %B %d, %Y')}")
-    print("-" * 120)
-    print(f"{'Employee Name':<20} {'Job Title':<25} {'Shift Time':<20} {'Roles':<55}")
-    print("-" * 120)
+    print(f"\nDaily Overview")
+    print(f"{target_date.strftime('%m/%d/%Y')}")
+    print("-" * 100)
+    print(f"{'Associate':<20} {'Jobs':<20} {'Shift/Roles':<40} {'Meals':<20}")
+    print("-" * 100)
 
-    scheduled_employees = []
-
+    all_employees = []
     for _, employee in df.iterrows():
         start_time, end_time = parse_shift_time(employee['Availability'], target_day)
         if start_time and end_time:
-            scheduled_employees.append((
+            all_employees.append((
                 employee['Employee Name'],
                 employee['Job Title'],
                 (start_time, end_time),
-                employee['Roles']
+                None,  # Placeholder for meal break
+                employee['Roles'],
+                employee['Employment Status']
             ))
 
-    # Sort employees by shift start time
+    max_employees_per_day = 28
+    min_closing_count = 4
+    max_early_morning_count = 6  # Strict limit for early morning shifts
+
+    scheduled_employees = []
+
+    # Schedule the closing shifts first
+    closing_employees = sorted(
+        [e for e in all_employees if e[2][1] == datetime.strptime("23:00", "%H:%M").time()],
+        key=lambda x: weekly_late_night_counts.get(x[0], 0)
+    )
+    for employee in closing_employees:
+        if len(scheduled_employees) >= min_closing_count:
+            break
+        start_time = max(employee[2][0], datetime.strptime("15:00", "%H:%M").time())
+        scheduled_employees.append(employee[:2] + ((start_time, employee[2][1]),) + employee[3:])
+        weekly_late_night_counts[employee[0]] = weekly_late_night_counts.get(employee[0], 0) + 1
+
+    if len(scheduled_employees) < min_closing_count:
+        scheduled_employees = ensure_late_night_coverage(scheduled_employees, all_employees, max_employees_per_day)
+        for employee in scheduled_employees:
+            if employee[2][1] == datetime.strptime("23:00", "%H:%M").time():
+                weekly_late_night_counts[employee[0]] = weekly_late_night_counts.get(employee[0], 0) + 1
+
+    # Define shift groups
+    early_morning_shift = (datetime.strptime("05:00", "%H:%M").time(), datetime.strptime("13:00", "%H:%M").time())
+    mid_morning_shift = (datetime.strptime("09:00", "%H:%M").time(), datetime.strptime("17:00", "%H:%M").time())
+    afternoon_shift = (datetime.strptime("13:00", "%H:%M").time(), datetime.strptime("21:00", "%H:%M").time())
+    evening_shift = (datetime.strptime("15:00", "%H:%M").time(), datetime.strptime("23:00", "%H:%M").time())
+
+    shift_groups = [early_morning_shift, mid_morning_shift, afternoon_shift, evening_shift]
+
+    def schedule_shift_group(shift_group, group_limit):
+        nonlocal scheduled_employees  # Ensure we're modifying the correct variable
+        group_count = 0
+        for employee in all_employees:
+            if group_count >= group_limit:
+                break
+            if employee not in scheduled_employees:
+                start_time, end_time = employee[2]
+                if start_time >= shift_group[0] and end_time <= shift_group[1]:
+                    scheduled_employees.append(employee[:2] + ((start_time, end_time),) + employee[3:])
+                    group_count += 1
+
+    # Schedule early morning shifts with strict limit
+    schedule_shift_group(early_morning_shift, max_early_morning_count)
+
+    # Schedule remaining employees in other shift groups
+    remaining_slots = max_employees_per_day - len(scheduled_employees)
+    for shift_group in shift_groups[1:]:
+        schedule_shift_group(shift_group, remaining_slots // (len(shift_groups) - 1))
+
+    # Initialize hourly staff count
+    hourly_staff_count = [0] * 24
+    for employee in scheduled_employees:
+        for hour in range(employee[2][0].hour, employee[2][1].hour):
+            hourly_staff_count[hour] += 1
+
+    # Distribute shifts evenly
+    scheduled_employees = distribute_shifts_evenly(scheduled_employees, all_employees, max_employees_per_day, hourly_staff_count)
+
+    # Adjust shift durations
+    for i, employee in enumerate(scheduled_employees):
+        start_time, end_time = adjust_shift_duration(employee[2][0], employee[2][1], employee[5])
+        scheduled_employees[i] = employee[:2] + ((start_time, end_time),) + employee[3:]
+
+    # Schedule meal breaks
+    for i, employee in enumerate(scheduled_employees):
+        meal_start, meal_end = schedule_meal_break(employee[2][0], employee[2][1], min(hourly_staff_count[employee[2][0].hour:employee[2][1].hour]))
+        scheduled_employees[i] = employee[:3] + ((meal_start, meal_end),) + employee[4:]
+
+    # Sort final schedule by start time
     scheduled_employees.sort(key=lambda x: x[2][0])
 
-    for name, title, (start_time, end_time), roles in scheduled_employees:
-        print(f"{name:<20} {title:<25} {start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M'):<14} {roles[:55]}")
+    # Print the schedule
+    current_employee = ""
+    for name, title, (start_time, end_time), (meal_start, meal_end), roles, _ in scheduled_employees:
+        if name != current_employee:
+            print(f"{name:<20} {title:<20}", end="")
+            current_employee = name
+        else:
+            print(f"{'':20} {'':20}", end="")
+
+        shift_str = format_time_range(start_time, end_time)
+        roles_str = roles[:30]  # Truncate roles to fit
+        meal_str = format_time_range(meal_start, meal_end)
+
+        print(f"{shift_str} {roles_str:<30} {meal_str}")
+
+    print(f"\nTotal employees scheduled: {len(scheduled_employees)}")
+    print(f"Employees starting at 5:00 AM: {sum(1 for e in scheduled_employees if e[2][0] == datetime.strptime('05:00', '%H:%M').time())}")
+    print(f"Employees staying until 11:00 PM: {sum(1 for e in scheduled_employees if e[2][1] == datetime.strptime('23:00', '%H:%M').time())}")
+    print(f"Employees present by 8:00 AM: {count_employees_in_timeframe(scheduled_employees, 5, 8)}")
+    print(f"Employees present from 10:30 AM to 2:00 PM: {count_employees_in_timeframe(scheduled_employees, 10, 14)}")
+    print(f"Employees present after 2:00 PM: {count_employees_in_timeframe(scheduled_employees, 14, 23)}")
+
+    return scheduled_employees, weekly_late_night_counts
 
 def generate_weekly_schedule(df, start_date):
-    print(f"Weekly Schedule")
-    print(f"Week of {start_date.strftime('%B %d, %Y')}")
-    print()
-
+    weekly_late_night_counts = {}
     for i in range(7):
         current_date = start_date + timedelta(days=i)
-        generate_daily_schedule(df, current_date)
-        print()
+        _, weekly_late_night_counts = generate_daily_schedule(df, current_date, weekly_late_night_counts)
+        print("\n")
 
 # Get the CSV file path from the user
 while True:
@@ -70,10 +274,6 @@ print("Columns in the DataFrame:")
 print(df.columns)
 print("\nSample data:")
 print(df.head())
-
-# Print unique values in the Availability column
-print("\nUnique values in the Availability column:")
-print(df['Availability'].unique())
 
 # Get user input for the start date of the week
 while True:
